@@ -113,7 +113,7 @@ module Flow =
     
     override this.CreateLogic(_: Attributes) = Logic(this.Shape, in1, out1, in2, out2, retryWith) :> _
     
-  let retryAsGraph<'i, 'o, 's, 'e, 'm> 
+  let retry<'i, 'o, 's, 'e, 'm> 
         (retryWith: 's -> (Result<'o, 'e> * 's) option) 
         (flow: IGraph<FlowShape<'i * 's, Result<'o, 'e> * 's>, 'm>) 
         : IGraph<FlowShape<'i * 's, Result<'o, 'e>>, 'm> =
@@ -124,11 +124,13 @@ module Flow =
       FlowShape(retry.Inlet1, retry.Outlet1)
     )
     
-  let retry retryWith flow = 
-    flow
-    |> Flow.FromGraph
-    |> retryAsGraph retryWith 
-    |> Flow.FromGraph
+//  let retry retryWith flow = 
+//    flow
+//    |> Flow.FromGraph
+//    |> retryAsGraph retryWith 
+//    |> Flow.FromGraph
+
+type Attempt = int
 
 [<EntryPoint>]
 let main _ = 
@@ -166,31 +168,33 @@ akka {
             //.WithSupervisionStrategy(Deciders.RestartingDecider)
         |> system.Materializer
         
-    let flow : Flow<int, Result<int, string>, NotUsed> = 
+    let flow : Flow<int * Attempt, Result<int, string> * Attempt, NotUsed> = 
         Flow.id 
-        |> Flow.map (function
-            | 6 | 7 | 8 -> Result.Error "It's 6 and we are failing"
-            | x -> Result.Ok x) 
+        |> Flow.map (fun (x, attempt) ->
+            match x with
+            | 6 | 7 | 8 -> Result.Error (sprintf "It's %d and we are failing" x), attempt + 1 
+            | x -> Result.Ok x, attempt + 1)
         
-    let restartFlow =
-        RestartFlow.WithBackoff(
-            (fun _ -> flow), TimeSpan.FromSeconds 1., TimeSpan.FromSeconds 5., 0.2)
+//    let restartFlow =
+//        RestartFlow.WithBackoff(
+//            (fun _ -> flow), TimeSpan.FromSeconds 1., TimeSpan.FromSeconds 5., 0.2)
         
-    let retryFlow =
-        restartFlow
-        |> Flow.map (fun x -> x, 0)
-        |> Flow.retry (fun s -> None)
-//             if s < 3 then 
-//                Some (Result.Error (sprintf "attempt %d failed" s), s + 1)
-//             else 
-                //None)
+    let retryFlow s =
+        s
+        |> Source.map (fun x -> x, 0)
+        |> Source.via(
+             flow
+             |> Flow.retry (fun s ->
+                  if s < 3 then 
+                     Some (Result.Error (sprintf "attempt %d failed" s), s + 1)
+                  else 
+                     None)
+           )
         
     async {
         do! [1..10]
             |> Source.ofList
-            |> Source.via restartFlow
-            |> Source.map (fun x -> x, 0)
-            |> Source.via (Flow.retry (fun s -> None) Flow.id)
+            |> retryFlow
             |> Source.runWith mat (Sink.forEach (printfn "%A"))
         
         do! system.Terminate() |> Async.AwaitTask
